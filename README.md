@@ -16,7 +16,7 @@ Unofficial integration for **VandCenter Syd** water meters in Home Assistant. Mo
 ## Features
 
 - **Real-time consumption** – Current total meter reading and daily usage statistics
-- **Historical data** – Import up to 2 years of historical consumption data into Home Assistant's long-term statistics
+- **Hourly history** – Imports hour-by-hour consumption into Home Assistant's long-term statistics, placed at the hour it was actually used (backfills 30 days on first run)
 - **Energy Dashboard support** – Track water usage alongside electricity and gas in the Home Assistant Energy Dashboard
 - **Automatic authentication** – Handles token refresh automatically (tokens expire after 1 hour)
 - **Multi-device support** – Automatically discovers all water meters associated with your account
@@ -61,21 +61,32 @@ For each water meter discovered, the following sensors are created:
 | **Average Daily** | Average consumption over the reporting period (last 14 days) | `total` |
 | **Period Max** | Highest single-day consumption in the period (last 14 days) | `total` |
 
+## Hourly Consumption Statistics
+
+Meter readings reach the Smart Forsyning API with a delay, so the **Total** sensor only increases when a batch of readings arrives. On its own, that makes all the consumption show up at the moment of the update.
+
+To fix this, the integration also fetches hourly consumption and imports it as an external statistic per meter:
+
+| Statistic ID | Name |
+|--------------|------|
+| `vandcenter_syd:<device_id>_water_consumption` | `<Meter> Water Consumption` |
+
+Each hour is recorded at the time the water was used. Every refresh re-imports the last 72 hours, so late or corrected readings get picked up. To see the data hour by hour, use a **Statistics Graph** card with this statistic, or the Energy Dashboard.
+
 ## Energy Dashboard Setup
 
 To track water consumption in the Home Assistant Energy Dashboard:
 
 1. Go to **Settings > Dashboards > Energy**
 2. Click **Add Water Source**
-3. Select your **Total Reading** sensor (e.g., `sensor.vandcenter_syd_total_reading`)
-4. The integration will automatically calculate daily consumption from the total meter reading
+3. Select the **`<Meter> Water Consumption`** statistic (`vandcenter_syd:<device_id>_water_consumption`)
 
-**Note:** The first time you add the sensor, it may take up to 2 hours for historical data to appear in the Energy Dashboard.
+**Note:** Hourly data appears after the first refresh. If you previously used the **Total** sensor as the water source, replace it with the statistic above to get correct hourly placement.
 
 ## API Limitations
 
-- **Update frequency**: Data is fetched every 6 hours to respect API rate limits
-- **Resolution**: The API provides daily consumption buckets (not real-time hourly data)
+- **Update frequency**: Data is fetched at the start of every hour
+- **Resolution**: Hourly consumption buckets, delivered by the meter with a delay
 - **Geographic restriction**: Only works for VandCenter Syd customers in Denmark
 
 ## Troubleshooting
@@ -89,8 +100,8 @@ To track water consumption in the Home Assistant Energy Dashboard:
 - The integration will automatically retry on token expiration
 
 ### No historical data in Energy Dashboard
-- Historical import runs asynchronously after setup; wait 5-10 minutes
-- Verify the **Total Reading** sensor (not Daily Usage) is added to the Energy Dashboard
+- Historical import runs after the first refresh; wait a few minutes
+- Verify the **Water Consumption** statistic is added to the Energy Dashboard
 
 ### Missing meters
 - Ensure your meters are visible in the Smart Forsyning web portal
@@ -101,7 +112,7 @@ To track water consumption in the Home Assistant Energy Dashboard:
 This integration uses the unofficial Smart Forsyning REST API:
 - `GET /api/Customer/details` – Location and account information
 - `GET /api/Customer/devices` – Device enumeration
-- `POST /api/Stats/usage/{locationId}/devices` – Daily consumption statistics
+- `POST /api/Stats/usage/{locationId}/devices` – Daily and hourly consumption statistics
 - `POST /api/Stats/readings/devices` – Current meter readings
 - `POST /api/Customer/login` – Authentication (automatic token refresh)
 

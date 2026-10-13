@@ -6,10 +6,25 @@ from datetime import datetime, timedelta, timezone
 
 import async_timeout
 from aiohttp import ClientResponseError
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+    statistics_during_period,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
+from homeassistant.util import slugify
+from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import (
     API_BASE,
@@ -18,7 +33,11 @@ from .const import (
     CONF_TOKEN,
     CONF_TOKEN_EXPIRES,
     DOMAIN,
+    HOURLY_BACKFILL_DAYS,
+    HOURLY_REFRESH_HOURS,
 )
+
+API_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.000Z"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,14 +70,26 @@ class VandCenterCoordinator(DataUpdateCoordinator):
         headers = {"Authorization": f"Bearer {self.token}"}
 
         try:
-            return await self._fetch_data(headers)
+            data = await self._fetch_data(headers)
         except ClientResponseError as err:
-            if err.status == 401:
-                # Token expired, refresh and retry
-                await self._refresh_token()
-                headers = {"Authorization": f"Bearer {self.token}"}
-                return await self._fetch_data(headers)
-            raise UpdateFailed(f"API error: {err}")
+            if err.status != 401:
+                raise UpdateFailed(f"API error: {err}")
+            # Token expired, refresh and retry
+            await self._refresh_token()
+            headers = {"Authorization": f"Bearer {self.token}"}
+            data = await self._fetch_data(headers)
+
+        for device_id, device_data in data["devices"].items():
+            try:
+                await self._async_import_hourly_statistics(
+                    headers, device_id, device_data
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to import hourly statistics for %s: %s", device_id, err
+                )
+
+        return data
 
     async def _refresh_token(self):
         """Login to get new token."""
@@ -123,8 +154,8 @@ class VandCenterCoordinator(DataUpdateCoordinator):
 
                     payload = {
                         "DeviceIds": [device_id],
-                        "From": from_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                        "To": to_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "From": from_date.strftime(API_DATE_FORMAT),
+                        "To": to_date.strftime(API_DATE_FORMAT),
                         "Interval": "Daily",
                         "QuantityType": "WaterVolume",
                         "Unit": "KubicMeter",
@@ -190,3 +221,125 @@ class VandCenterCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("Failed to fetch price from vandcenter.dk: %s", err)
 
             return {"devices": all_device_data, "price": price}
+
+    async def _async_import_hourly_statistics(
+        self, headers: dict, device_id, device_data: dict
+    ) -> None:
+        """Import hourly consumption into long-term statistics.
+
+        Meter data reaches the API with a delay, so the last HOURLY_REFRESH_HOURS
+        are fetched again on every refresh and re-imported. Statistics are keyed
+        by their start hour, so re-importing an hour overwrites it.
+        """
+        statistic_id = f"{DOMAIN}:{slugify(str(device_id))}_water_consumption"
+        recorder = get_instance(self.hass)
+        now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+
+        last_stats = await recorder.async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+        )
+        if not last_stats.get(statistic_id):
+            start = now_hour - timedelta(days=HOURLY_BACKFILL_DAYS)
+            running_sum = 0.0
+        else:
+            last = last_stats[statistic_id][0]
+            start = dt_util.utc_from_timestamp(last["start"]) + timedelta(hours=1)
+            running_sum = last["sum"] or 0.0
+
+            # Step back to re-import recent hours, continuing from the sum of
+            # the hour just before the re-import window
+            refresh_start = now_hour - timedelta(hours=HOURLY_REFRESH_HOURS)
+            if refresh_start < start:
+                prior = await recorder.async_add_executor_job(
+                    statistics_during_period,
+                    self.hass,
+                    refresh_start - timedelta(hours=1),
+                    refresh_start,
+                    {statistic_id},
+                    "hour",
+                    None,
+                    {"sum"},
+                )
+                if prior.get(statistic_id):
+                    start = refresh_start
+                    running_sum = prior[statistic_id][0]["sum"] or 0.0
+
+        buckets = await self._fetch_hourly_buckets(
+            headers, device_data["location"]["LocationId"], device_id, start, now_hour
+        )
+        if not buckets:
+            return
+
+        statistics: list[StatisticData] = []
+        for hour_start, value in buckets:
+            running_sum += value
+            statistics.append(StatisticData(start=hour_start, sum=running_sum))
+
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=f"{device_data['device']['BrandName']} Water Consumption",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=VolumeConverter.UNIT_CLASS,
+            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+        )
+        async_add_external_statistics(self.hass, metadata, statistics)
+        _LOGGER.debug(
+            "Imported %s hourly statistics for %s from %s",
+            len(statistics),
+            statistic_id,
+            statistics[0]["start"],
+        )
+
+    async def _fetch_hourly_buckets(
+        self, headers: dict, loc_id, device_id, start: datetime, end: datetime
+    ) -> list[tuple[datetime, float]]:
+        """Return (hour start, m³) for each complete hour between start and end.
+
+        The API labels hourly buckets by the end of the hour, and From/To filter
+        on those labels. Requests are made one day at a time, like the portal.
+        """
+        by_end: dict[datetime, dict] = {}
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + timedelta(days=1), end)
+            payload = {
+                "DeviceIds": [device_id],
+                "From": (chunk_start + timedelta(hours=1)).strftime(API_DATE_FORMAT),
+                "To": chunk_end.strftime(API_DATE_FORMAT),
+                "Interval": "Hourly",
+                "QuantityType": "WaterVolume",
+                "Unit": "KubicMeter",
+            }
+            async with async_timeout.timeout(30):
+                resp = await self.session.post(
+                    f"{API_BASE}/Stats/usage/{loc_id}/devices",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                usage = await resp.json()
+
+            for bucket in (usage or {}).get("Buckets") or []:
+                bucket_end = dt_util.parse_datetime(bucket.get("Timestamp") or "")
+                if bucket_end is None or bucket.get("Value") is None:
+                    continue
+                if bucket_end.tzinfo is None:
+                    bucket_end = bucket_end.replace(tzinfo=timezone.utc)
+                bucket_end = dt_util.as_utc(bucket_end)
+                if start < bucket_end <= end:
+                    by_end[bucket_end] = bucket
+
+            chunk_start = chunk_end
+
+        ordered = sorted(by_end.items())
+        # Trailing hours without readings have not been delivered by the meter
+        # yet; leave them out so they are not recorded as zero consumption
+        while ordered and ordered[-1][1].get("Count", 1) == 0:
+            ordered.pop()
+
+        return [
+            (bucket_end - timedelta(hours=1), float(bucket["Value"]))
+            for bucket_end, bucket in ordered
+        ]
