@@ -5,6 +5,7 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_TOKEN = "token"
 CONF_TOKEN_EXPIRES = "token_expires"
+CONF_PRICE = "price_per_m3"
 
 API_BASE = "https://vandcenter.smartforsyning.dk/api"
 

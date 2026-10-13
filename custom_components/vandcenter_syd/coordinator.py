@@ -30,6 +30,7 @@ from .const import (
     API_BASE,
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_PRICE,
     CONF_TOKEN,
     CONF_TOKEN_EXPIRES,
     DOMAIN,
@@ -225,44 +226,56 @@ class VandCenterCoordinator(DataUpdateCoordinator):
     async def _async_import_hourly_statistics(
         self, headers: dict, device_id, device_data: dict
     ) -> None:
-        """Import hourly consumption into long-term statistics.
+        """Import hourly consumption, and cost if a price is set, into statistics.
 
         Meter data reaches the API with a delay, so the last HOURLY_REFRESH_HOURS
         are fetched again on every refresh and re-imported. Statistics are keyed
         by their start hour, so re-importing an hour overwrites it.
         """
-        statistic_id = f"{DOMAIN}:{slugify(str(device_id))}_water_consumption"
+        stat_prefix = f"{DOMAIN}:{slugify(str(device_id))}"
+        name_prefix = device_data["device"]["BrandName"]
+        consumption = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=f"{name_prefix} Water Consumption",
+            source=DOMAIN,
+            statistic_id=f"{stat_prefix}_water_consumption",
+            unit_class=VolumeConverter.UNIT_CLASS,
+            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+        )
+        targets: list[tuple[StatisticMetaData, float]] = [(consumption, 1.0)]
+
+        price = self.entry.options.get(CONF_PRICE)
+        if price is not None:
+            cost = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=f"{name_prefix} Water Cost",
+                source=DOMAIN,
+                statistic_id=f"{stat_prefix}_water_cost",
+                unit_class=None,
+                unit_of_measurement=self.hass.config.currency,
+            )
+            targets.append((cost, price))
+
         recorder = get_instance(self.hass)
         now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
 
-        last_stats = await recorder.async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
-        )
-        if not last_stats.get(statistic_id):
-            start = now_hour - timedelta(days=HOURLY_BACKFILL_DAYS)
-            running_sum = 0.0
-        else:
-            last = last_stats[statistic_id][0]
-            start = dt_util.utc_from_timestamp(last["start"]) + timedelta(hours=1)
-            running_sum = last["sum"] or 0.0
-
-            # Step back to re-import recent hours, continuing from the sum of
-            # the hour just before the re-import window
-            refresh_start = now_hour - timedelta(hours=HOURLY_REFRESH_HOURS)
-            if refresh_start < start:
-                prior = await recorder.async_add_executor_job(
-                    statistics_during_period,
-                    self.hass,
-                    refresh_start - timedelta(hours=1),
-                    refresh_start,
-                    {statistic_id},
-                    "hour",
-                    None,
-                    {"sum"},
-                )
-                if prior.get(statistic_id):
-                    start = refresh_start
-                    running_sum = prior[statistic_id][0]["sum"] or 0.0
+        # Start at the earliest hour any of the statistics needs
+        start = now_hour - timedelta(hours=HOURLY_REFRESH_HOURS)
+        last_rows = {}
+        for metadata, _ in targets:
+            statistic_id = metadata["statistic_id"]
+            last_stats = await recorder.async_add_executor_job(
+                get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+            )
+            if last_stats.get(statistic_id):
+                last = last_stats[statistic_id][0]
+                last_rows[statistic_id] = last
+                last_start = dt_util.utc_from_timestamp(last["start"])
+                start = min(start, last_start + timedelta(hours=1))
+            else:
+                start = min(start, now_hour - timedelta(days=HOURLY_BACKFILL_DAYS))
 
         buckets = await self._fetch_hourly_buckets(
             headers, device_data["location"]["LocationId"], device_id, start, now_hour
@@ -270,27 +283,46 @@ class VandCenterCoordinator(DataUpdateCoordinator):
         if not buckets:
             return
 
-        statistics: list[StatisticData] = []
-        for hour_start, value in buckets:
-            running_sum += value
-            statistics.append(StatisticData(start=hour_start, sum=running_sum))
+        for metadata, factor in targets:
+            statistic_id = metadata["statistic_id"]
+            running_sum = await self._async_get_sum_before(
+                statistic_id, start, last_rows.get(statistic_id)
+            )
+            statistics: list[StatisticData] = []
+            for hour_start, value in buckets:
+                running_sum += value * factor
+                statistics.append(StatisticData(start=hour_start, sum=running_sum))
 
-        metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"{device_data['device']['BrandName']} Water Consumption",
-            source=DOMAIN,
-            statistic_id=statistic_id,
-            unit_class=VolumeConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+            async_add_external_statistics(self.hass, metadata, statistics)
+            _LOGGER.debug(
+                "Imported %s hourly statistics for %s from %s",
+                len(statistics),
+                statistic_id,
+                statistics[0]["start"],
+            )
+
+    async def _async_get_sum_before(
+        self, statistic_id: str, start: datetime, last: dict | None
+    ) -> float:
+        """Return the sum of the latest statistic before start, or 0 if none."""
+        if last is None:
+            return 0.0
+        if dt_util.utc_from_timestamp(last["start"]) < start:
+            return last["sum"] or 0.0
+
+        rows = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            start - timedelta(days=HOURLY_BACKFILL_DAYS),
+            start,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
         )
-        async_add_external_statistics(self.hass, metadata, statistics)
-        _LOGGER.debug(
-            "Imported %s hourly statistics for %s from %s",
-            len(statistics),
-            statistic_id,
-            statistics[0]["start"],
-        )
+        if not rows.get(statistic_id):
+            return 0.0
+        return rows[statistic_id][-1]["sum"] or 0.0
 
     async def _fetch_hourly_buckets(
         self, headers: dict, loc_id, device_id, start: datetime, end: datetime

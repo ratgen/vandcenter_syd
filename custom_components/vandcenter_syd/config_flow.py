@@ -2,6 +2,7 @@
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
@@ -10,6 +11,7 @@ from .const import (
     DOMAIN,
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_PRICE,
     CONF_TOKEN_EXPIRES,
 )
 
@@ -18,6 +20,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        """Get the options flow for this handler."""
+        return OptionsFlowHandler()
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""
@@ -59,4 +67,33 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             description_placeholders={"url": "https://vandcenter.smartforsyning.dk"},
             errors=errors,
+        )
+
+
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    """Handle options."""
+
+    async def async_step_init(self, user_input=None):
+        """Manage the fixed price per m³."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        price = self.config_entry.options.get(CONF_PRICE)
+        if price is None:
+            # Suggest the price scraped from vandcenter.dk
+            coordinator = self.hass.data[DOMAIN][self.config_entry.entry_id][
+                "coordinator"
+            ]
+            price = coordinator.data.get("price") or None
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_PRICE,
+                        description={"suggested_value": price},
+                    ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+                }
+            ),
         )

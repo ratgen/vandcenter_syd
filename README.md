@@ -70,6 +70,7 @@ To fix this, the integration also fetches hourly consumption and imports it as a
 | Statistic ID | Name |
 |--------------|------|
 | `vandcenter_syd:<device_id>_water_consumption` | `<Meter> Water Consumption` |
+| `vandcenter_syd:<device_id>_water_cost` | `<Meter> Water Cost` (only when a price is set) |
 
 Each hour is recorded at the time the water was used. Every refresh re-imports the last 72 hours, so late or corrected readings get picked up. To see the data hour by hour, use a **Statistics Graph** card with this statistic, or the Energy Dashboard.
 
@@ -80,6 +81,16 @@ To track water consumption in the Home Assistant Energy Dashboard:
 1. Go to **Settings > Dashboards > Energy**
 2. Click **Add Water Source**
 3. Select the **`<Meter> Water Consumption`** statistic (`vandcenter_syd:<device_id>_water_consumption`)
+
+### Tracking cost
+
+Home Assistant's "Use a static price" option is only available for sensor entities, not for imported statistics. Instead, set a fixed price in the integration:
+
+1. Go to **Settings > Devices & Services > VandCenter Syd > Configure**
+2. Enter the **Price per m³** (pre-filled with the current price from vandcenter.dk)
+3. In the water source dialog, choose **Use an entity tracking the total costs** and select the **`<Meter> Water Cost`** statistic
+
+The cost statistic is backfilled 30 days the first time a price is set. A price change applies from the last 72 hours onward. Clear the field to stop tracking cost.
 
 **Note:** Hourly data appears after the first refresh. If you previously used the **Total** sensor as the water source, replace it with the statistic above to get correct hourly placement.
 
