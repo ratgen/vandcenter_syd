@@ -40,6 +40,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "coordinator": coordinator,
         "unsubscribe": unsubscribe,
+        "options": dict(entry.options),
     }
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
@@ -47,7 +48,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when options change, so the new price is applied."""
+    """Reload when options change, so the new price is applied.
+
+    Token renewals update the entry data too; those need no reload.
+    """
+    if dict(entry.options) == hass.data[DOMAIN][entry.entry_id]["options"]:
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 

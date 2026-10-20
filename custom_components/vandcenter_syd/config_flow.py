@@ -69,6 +69,46 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reauth(self, entry_data):
+        """Start reauthentication when the stored password is rejected."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        """Ask for a new password and log in with it."""
+        errors = {}
+        entry = self._get_reauth_entry()
+        email = entry.data[CONF_EMAIL]
+
+        if user_input is not None:
+            password = user_input[CONF_PASSWORD]
+            session = async_get_clientsession(self.hass)
+
+            try:
+                resp = await session.post(
+                    f"{API_BASE}/Customer/login",
+                    json={"MatchTag": None, "Email": email, "Password": password},
+                )
+                if resp.status == 200:
+                    data = await resp.json()
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data_updates={
+                            CONF_PASSWORD: password,
+                            CONF_TOKEN: data["AuthToken"],
+                            CONF_TOKEN_EXPIRES: data["ExpiresIn"],
+                        },
+                    )
+                errors["base"] = "invalid_auth"
+            except Exception:
+                errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
+            description_placeholders={"email": email},
+            errors=errors,
+        )
+
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options."""

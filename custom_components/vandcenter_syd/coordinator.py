@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import async_timeout
-from aiohttp import ClientResponseError
+from aiohttp import ClientError, ClientResponseError
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -20,6 +20,7 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -95,31 +96,35 @@ class VandCenterCoordinator(DataUpdateCoordinator):
     async def _refresh_token(self):
         """Login to get new token."""
         try:
-            resp = await self.session.post(
-                f"{API_BASE}/Customer/login",
-                json={
-                    "MatchTag": None,
-                    "Email": self.entry.data[CONF_EMAIL],
-                    "Password": self.entry.data[CONF_PASSWORD],
-                },
-            )
-            resp.raise_for_status()
-            data = await resp.json()
+            async with async_timeout.timeout(30):
+                resp = await self.session.post(
+                    f"{API_BASE}/Customer/login",
+                    json={
+                        "MatchTag": None,
+                        "Email": self.entry.data[CONF_EMAIL],
+                        "Password": self.entry.data[CONF_PASSWORD],
+                    },
+                )
+                if 400 <= resp.status < 500:
+                    # Credentials rejected, let Home Assistant ask for new ones
+                    raise ConfigEntryAuthFailed(
+                        f"Login rejected with status {resp.status}"
+                    )
+                resp.raise_for_status()
+                data = await resp.json()
+        except (ClientError, TimeoutError) as err:
+            raise UpdateFailed(f"Failed to refresh token: {err}") from err
 
-            # Update config entry with new token
-            self.hass.config_entries.async_update_entry(
-                self.entry,
-                data={
-                    **self.entry.data,
-                    CONF_TOKEN: data["AuthToken"],
-                    CONF_TOKEN_EXPIRES: data["ExpiresIn"],
-                },
-            )
-            _LOGGER.debug("Token refreshed successfully")
-
-        except Exception as err:
-            _LOGGER.error("Failed to refresh token: %s", err)
-            raise UpdateFailed("Authentication failed, please reconfigure integration")
+        # Update config entry with new token
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={
+                **self.entry.data,
+                CONF_TOKEN: data["AuthToken"],
+                CONF_TOKEN_EXPIRES: data["ExpiresIn"],
+            },
+        )
+        _LOGGER.debug("Token refreshed successfully")
 
     async def _fetch_data(self, headers) -> dict:
         """Actual data fetching logic."""
