@@ -283,10 +283,15 @@ class VandCenterCoordinator(DataUpdateCoordinator):
         if not buckets:
             return
 
+        # Continue the sum from the hour before the first bucket, not before
+        # start: if the API leaves out the first hours of the window, the rows
+        # already stored for them would otherwise sit above the new sums and
+        # show up as negative consumption
+        first_hour = buckets[0][0]
         for metadata, factor in targets:
             statistic_id = metadata["statistic_id"]
             running_sum = await self._async_get_sum_before(
-                statistic_id, start, last_rows.get(statistic_id)
+                statistic_id, first_hour, last_rows.get(statistic_id)
             )
             statistics: list[StatisticData] = []
             for hour_start, value in buckets:
